@@ -382,7 +382,7 @@ class CreateDraftReplyInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
     email_id: str = Field(..., description="Exchange item ID of the email to reply to")
     body: str = Field(..., description="Reply body (plain text or HTML)")
-    reply_all: Optional[bool] = Field(default=False, description="If True, addresses all original recipients; otherwise sender only")
+    reply_all: Optional[bool] = Field(default=False, description="If True, reply-all; otherwise reply to sender only")
     folder: Optional[str] = Field(default="inbox", description="Folder the original email lives in — 'inbox', 'sent', 'drafts', or any custom folder")
 
 
@@ -1554,6 +1554,7 @@ if __name__ == "__main__":
         import uvicorn
         from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.responses import JSONResponse
+        from mcp.server.transport_security import TransportSecuritySettings
 
         AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 
@@ -1564,7 +1565,13 @@ if __name__ == "__main__":
                         return JSONResponse({"error": "Unauthorized"}, status_code=401)
                 return await call_next(request)
 
-        app = mcp.streamable_http_app()
+        # The SDK's DNS-rebinding Host-header check can't know the domain
+        # this gets deployed to ahead of time (different per deployer on
+        # Railway). Our own bearer-token auth above is the real access
+        # control here, so it's safe to disable this specific check.
+        app = mcp.streamable_http_app(
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        )
         app.add_middleware(BearerAuthMiddleware)
         uvicorn.run(app, host="0.0.0.0", port=int(port))
     else:
