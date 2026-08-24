@@ -418,6 +418,7 @@ if __name__ == "__main__":
         import uvicorn
         from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.responses import JSONResponse
+        from mcp.server.transport_security import TransportSecuritySettings
 
         AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 
@@ -428,7 +429,13 @@ if __name__ == "__main__":
                         return JSONResponse({"error": "Unauthorized"}, status_code=401)
                 return await call_next(request)
 
-        app = mcp.streamable_http_app()
+        # The SDK's DNS-rebinding Host-header check can't know the domain
+        # this gets deployed to ahead of time (different per deployer on
+        # Railway). Our own bearer-token auth above is the real access
+        # control here, so it's safe to disable this specific check.
+        app = mcp.streamable_http_app(
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        )
         app.add_middleware(BearerAuthMiddleware)
         uvicorn.run(app, host="0.0.0.0", port=int(port))
     else:
