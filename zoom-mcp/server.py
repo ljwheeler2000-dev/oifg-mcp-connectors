@@ -453,8 +453,11 @@ if __name__ == "__main__":
     port = os.environ.get("PORT")
     if port:
         import uvicorn
+        from starlette.applications import Starlette
         from starlette.middleware.base import BaseHTTPMiddleware
-        from starlette.responses import JSONResponse
+        from starlette.responses import JSONResponse, PlainTextResponse
+        from starlette.routing import Route, Mount
+        from contextlib import asynccontextmanager
 
         AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 
@@ -465,8 +468,34 @@ if __name__ == "__main__":
                         return JSONResponse({"error": "Unauthorized"}, status_code=401)
                 return await call_next(request)
 
-        app = mcp.streamable_http_app()
-        app.add_middleware(BearerAuthMiddleware)
+        async def health(request):
+            # Deliberately unauthenticated: Railway's healthcheck has no way
+            # to send the bearer token, and everything under mcp_app requires
+            # it. This route is a sibling of mcp_app (not mounted under it),
+            # so it can't become an auth bypass for anything else.
+            return PlainTextResponse("ok")
+
+        mcp_app = mcp.streamable_http_app()
+        mcp_app.add_middleware(BearerAuthMiddleware)
+
+        @asynccontextmanager
+        async def combined_lifespan(_app):
+            # Mount() does not forward ASGI lifespan events to the mounted
+            # sub-app, and mcp_app's session manager only starts inside its
+            # own lifespan (this is what actually starts its task group --
+            # without it every /mcp request 500s with "Task group is not
+            # initialized"). Manually entering it here on the outer app's
+            # startup/shutdown keeps that working exactly as before.
+            async with mcp_app.router.lifespan_context(mcp_app):
+                yield
+
+        app = Starlette(
+            routes=[
+                Route("/health", health),
+                Mount("/", app=mcp_app),
+            ],
+            lifespan=combined_lifespan,
+        )
         uvicorn.run(app, host="0.0.0.0", port=int(port))
     else:
         mcp.run(transport="stdio")
