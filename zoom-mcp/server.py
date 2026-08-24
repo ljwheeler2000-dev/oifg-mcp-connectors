@@ -19,6 +19,7 @@ from typing import Optional
 from dotenv import load_dotenv
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -51,7 +52,17 @@ if not all([ZOOM_ACCOUNT_ID, ZOOM_CLIENT_ID, ZOOM_CLIENT_SECRET, ZOOM_USER_ID]):
 if STATE_BACKEND == "supabase" and not (SUPABASE_URL and SUPABASE_KEY):
     raise RuntimeError("STATE_BACKEND=supabase requires SUPABASE_URL and SUPABASE_KEY to also be set")
 
-mcp = FastMCP("zoom_mcp")
+# DNS-rebinding protection is enabled by default and checks the incoming
+# Host header against an allowlist. That allowlist can't be hardcoded to a
+# domain ahead of time (Railway's domain isn't known at build time, and
+# every advisor who deploys this template gets a different one), so it's
+# disabled here. Our own bearer-token auth (added below, in the entry
+# point) is the real access control for the remote deployment; stdio/local
+# runs are unaffected since this setting only matters for HTTP transport.
+mcp = FastMCP(
+    "zoom_mcp",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +455,6 @@ if __name__ == "__main__":
         import uvicorn
         from starlette.middleware.base import BaseHTTPMiddleware
         from starlette.responses import JSONResponse
-        from mcp.server.transport_security import TransportSecuritySettings
 
         AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 
@@ -455,13 +465,7 @@ if __name__ == "__main__":
                         return JSONResponse({"error": "Unauthorized"}, status_code=401)
                 return await call_next(request)
 
-        # The SDK's DNS-rebinding Host-header check can't know the domain
-        # this gets deployed to ahead of time (different per deployer on
-        # Railway). Our own bearer-token auth above is the real access
-        # control here, so it's safe to disable this specific check.
-        app = mcp.streamable_http_app(
-            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
-        )
+        app = mcp.streamable_http_app()
         app.add_middleware(BearerAuthMiddleware)
         uvicorn.run(app, host="0.0.0.0", port=int(port))
     else:
