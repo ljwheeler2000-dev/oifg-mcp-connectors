@@ -1,6 +1,6 @@
 exchangelib>=5.4.0
 python-dotenv>=1.0.0
-mcp>=1.0.0
+mcp>=1.28,<2
 pydantic>=2.0.0
 
 uvicorn>=0.30.0
