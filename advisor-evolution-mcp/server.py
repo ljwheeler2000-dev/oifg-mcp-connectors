@@ -434,12 +434,19 @@ if __name__ == "__main__":
         from contextlib import asynccontextmanager
 
         AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+        if not AUTH_TOKEN:
+            raise RuntimeError(
+                "MCP_AUTH_TOKEN is not set. Refusing to start a remote (Streamable "
+                "HTTP) deployment without an auth token -- this connector exposes "
+                "real pipeline/business data, and running unauthenticated would "
+                "leave it open to anyone with the URL. Set MCP_AUTH_TOKEN and "
+                "redeploy."
+            )
 
         class BearerAuthMiddleware(BaseHTTPMiddleware):
             async def dispatch(self, request, call_next):
-                if AUTH_TOKEN:
-                    if request.headers.get("authorization", "") != f"Bearer {AUTH_TOKEN}":
-                        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+                if request.headers.get("authorization", "") != f"Bearer {AUTH_TOKEN}":
+                    return JSONResponse({"error": "Unauthorized"}, status_code=401)
                 return await call_next(request)
 
         async def health(request):
