@@ -9,6 +9,7 @@ MCP (Model Context Protocol) connectors for financial advisor tooling, built for
 | [`exchange-mcp`](./exchange-mcp) | Smarsh-hosted Microsoft Exchange (EWS) — email, calendar, contacts | EWS username/password |
 | [`zoom-mcp`](./zoom-mcp) | Zoom Cloud Recordings + AI Companion meeting summaries | Zoom Server-to-Server OAuth |
 | [`advisor-evolution-mcp`](./advisor-evolution-mcp) | Advisor Evolution (app.advisorevolution.io) Workspace API — pipeline, business, training, coaching | Static bearer token from AE's "Connect my AI" |
+| [`oneconnect-mcp`](./oneconnect-mcp) | OneConnect.pro (firm CRM) — accounts, prospects, tasks, meetings, contacts. Read-only — OneConnect's API has no write scopes yet. | Static bearer token from OneConnect Settings -> API Tokens |
 
 ## Deploying your own copy
 
@@ -28,10 +29,12 @@ Each connector folder is independently deployable. See that folder's own README 
      }
    }
    ```
-   Replace `<connector-name>` with whatever you want it labeled (e.g. `exchange`, `zoom`, `advisor-evolution`), and repeat the block per connector you deploy — they all merge under the same `mcpServers` key.
+   Replace `<connector-name>` with whatever you want it labeled (e.g. `exchange`, `zoom`, `advisor-evolution`, `oneconnect`), and repeat the block per connector you deploy — they all merge under the same `mcpServers` key.
 
    If your Claude Desktop build doesn't support the `"type": "http"` remote format natively, use the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge instead — point it at the same URL and token via its `--header` flag, and point Claude Desktop's config at the `mcp-remote` command rather than the URL directly. See that package's README for the exact `command`/`args` shape.
 4. Restart Claude Desktop.
+
+If your AI assistant isn't Claude, most MCP-capable clients accept the same `"type": "http"` + bearer-header remote-server shape — check your client's docs for where that config lives. If your assistant can't speak MCP at all, these connectors still work as a plain REST API — point whatever integration your assistant supports at the same Railway URL with the same bearer token.
 
 Nobody's credentials are shared between deployments — every deployer supplies their own secrets. This repo contains no secrets of any kind.
 
