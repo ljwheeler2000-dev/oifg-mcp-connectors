@@ -1,34 +1,52 @@
 #!/usr/bin/env python3
 """
-MCP Server for OneConnect.pro — read-only wrapper over its Workspace API.
+MCP Server for OneConnect.pro — mostly-read-only wrapper over its Workspace
+API, with file upload/delete added where testing confirmed it actually works.
 
 OneConnect.pro is a third-party CRM (built by HoosAI) used firm-wide at
 OneIndiana/OneFlorida/OneInvest as the Salesforce replacement. This
 connector wraps a per-advisor Personal Access Token (Settings -> API
-Tokens) so an assistant can read pipeline/client data on the advisor's
-behalf without holding their OneConnect password.
+Tokens) so an assistant can read pipeline/client data -- and now upload or
+delete files -- on the advisor's behalf without holding their OneConnect
+password.
 
 Authentication: static Bearer token, stored in .env next to this file.
 No OAuth flow -- just an API key, same pattern as advisor-evolution-mcp.
 
-READ-ONLY BY DESIGN, not by choice: as of the last verified check (see
-README), OneConnect.pro's API does not yet expose write scopes for
-accounts/prospects (accounts:write / prospects:write don't exist on any
-token yet -- tracked as an open feature request on ticket OC-150 with the
-vendor). This connector will only ever expose GET calls until that
-changes. Anything that "writes" client data today (e.g. a meeting-notes
-skill) should draft the text for the advisor to paste into OneConnect by
-hand -- do not simulate a write here.
+WRITE SUPPORT STATUS (last verified live against the vendor's API on
+2026-09-01 -- re-verify before trusting this if it's been a while):
+  - accounts:write / prospects:write do not exist as scopes on any token
+    yet. Not a bug, just not built on OneConnect's side (tracked as an
+    open feature request on ticket OC-176).
+  - tasks:write, clients:write, meetings:write all have valid scopes and
+    route to real endpoints, but every create attempt returns a clean
+    500 (no partial record left behind) -- confirmed broken on
+    OneConnect's backend, reported to the vendor with correlation IDs.
+    Do not add create_task/create_client/create_meeting tools until the
+    vendor confirms these actually work; they'll just 500.
+  - files:write DOES work, but only as multipart/form-data -- a plain
+    JSON POST to /files also 500s. delete (DELETE /files/{id}) works
+    too. Both confirmed with a real create-then-delete round trip.
+  - GET /files (the list endpoint) still 500s ("Failed to load
+    results") even though GET /files/{id} for a single record works
+    fine. So there's no list_files tool here -- only get_file(id) for
+    when you already have an id (e.g. from upload_file's response).
+
+Anything that "writes" client/task/meeting data today (e.g. a
+meeting-notes skill) should still draft the text for the advisor to
+paste into OneConnect by hand -- do not simulate those writes here.
 
 Known-flaky endpoints (confirmed against the vendor's own API, subject to
 change -- re-verify against README before assuming these are still
 accurate):
   - Working: {tenant}/accounts, {tenant}/prospects, /tasks, /meetings,
-    /contacts.
+    /contacts, /clients (returns real data, or an empty list if the
+    office has no records there -- that's not an error).
   - Broken as of last check: /team, /reports, /analytics, /scrum all
-    return 404 despite matching scopes existing on the token. /files
-    intermittently 500s. /contracts, /invoices, /milestones, /emails
-    scopes aren't offered by the token generator anymore (403 if tried).
+    return 404 despite matching scopes existing on the token. /planner,
+    /qa_automation, /qa_catalog also 404 on every path tried (2026-09-01)
+    -- may just be wrong paths, may not exist at all; no vendor docs to
+    check against. GET /files (list) 500s.
   - Routing inconsistency: accounts/prospects are tenant-scoped
     ({tenant}/accounts), everything else is top-level (/tasks, not
     {tenant}/tasks).
@@ -41,6 +59,7 @@ tenant slug here, since every advisor who deploys this template belongs
 to a different one.
 """
 
+import base64
 import json
 import os
 from typing import Optional
@@ -76,8 +95,10 @@ mcp = FastMCP(
 
 # Endpoints confirmed broken as of the last verified check (see README).
 # Surfaced here so tool docstrings and check_connection() can warn callers
-# instead of silently eating a 404/500.
-KNOWN_BROKEN = ["/team", "/reports", "/analytics", "/scrum", "/files"]
+# instead of silently eating a 404/500. /files here specifically means the
+# LIST endpoint -- get_file/upload_file/delete_file (single-record paths)
+# work fine.
+KNOWN_BROKEN = ["/team", "/reports", "/analytics", "/scrum", "/files (list)"]
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +146,7 @@ def check_connection() -> str:
         ("/tasks", "tasks"),
         ("/meetings", "meetings"),
         ("/contacts", "contacts"),
+        ("/clients", "clients"),
     ]
     for path, label in checks:
         try:
@@ -134,7 +156,14 @@ def check_connection() -> str:
         except Exception as e:
             result["endpoints"][label] = f"error: {e}"
     result["known_broken_elsewhere"] = KNOWN_BROKEN
-    result["note"] = "Write access (accounts:write / prospects:write) does not exist on the API yet -- read-only until that changes."
+    result["write_support"] = {
+        "accounts": "no write scope exists on the API yet",
+        "prospects": "no write scope exists on the API yet",
+        "tasks": "scope exists, endpoint 500s on create (reported to vendor)",
+        "clients": "scope exists, endpoint 500s on create (reported to vendor)",
+        "meetings": "scope exists, endpoint 500s on create (reported to vendor)",
+        "files": "works -- see upload_file / get_file / delete_file",
+    }
     return _ok(result)
 
 
@@ -162,8 +191,8 @@ def list_prospects() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tasks, meetings, contacts (top-level -- NOT tenant-scoped, per OneConnect's
-# own routing inconsistency)
+# Tasks, meetings, contacts, clients (top-level -- NOT tenant-scoped, per
+# OneConnect's own routing inconsistency)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -182,6 +211,75 @@ def list_meetings() -> str:
 def list_contacts() -> str:
     """List contacts from OneConnect. Read-only. Top-level endpoint (not tenant-scoped)."""
     return _ok(_get("/contacts"))
+
+
+@mcp.tool()
+def list_clients() -> str:
+    """
+    List records from OneConnect's /clients endpoint. Read-only,
+    top-level (not tenant-scoped). As of testing 2026-09-01 this returns
+    an empty list for at least one office -- that's a real "no records,"
+    not a broken endpoint, so don't treat an empty result as an error.
+    """
+    return _ok(_get("/clients"))
+
+
+# ---------------------------------------------------------------------------
+# Files -- the one place write access actually works. Upload requires
+# multipart/form-data; a plain JSON POST 500s. Confirmed with a real
+# create-then-delete round trip on 2026-09-01, no record left behind.
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_file(file_id: int) -> str:
+    """
+    Fetch a single OneConnect file record by its numeric id. Useful
+    because GET /files (the list endpoint) currently returns a 500 --
+    there's no way to browse files, only to fetch one you already know
+    the id of (e.g. the id upload_file just gave you).
+    """
+    return _ok(_get(f"/files/{file_id}"))
+
+
+@mcp.tool()
+def upload_file(filename: str, content_base64: str, mime_type: Optional[str] = None) -> str:
+    """
+    Upload a file to OneConnect's general File Cabinet. Confirmed working
+    2026-09-01 -- must be sent as multipart/form-data (a JSON POST to
+    this same endpoint 500s, so this tool always uses multipart).
+
+    Pass the file's bytes as base64 in content_base64. The created
+    record starts in "pending_upload" status and isn't yet linked to a
+    specific client/account/meeting -- OneConnect's create endpoint
+    doesn't expose that association as of this testing. Keep the
+    returned id if you'll want to fetch (get_file) or remove
+    (delete_file) it later.
+    """
+    raw = base64.b64decode(content_base64)
+    files = {"file": (filename, raw, mime_type or "application/octet-stream")}
+    with httpx.Client(timeout=30) as client:
+        r = client.post(f"{OC_BASE}/files", headers=_headers(), files=files)
+        _raise_with_body(r)
+        return _ok(r.json())
+
+
+@mcp.tool()
+def delete_file(file_id: int) -> str:
+    """
+    Permanently delete a OneConnect file record by its numeric id.
+    Confirmed working 2026-09-01 (create-then-delete round trip left
+    nothing behind, verified with a follow-up 404). OneConnect has no
+    trash/undo for this as far as this connector has tested -- double
+    check the id before calling this on anything that wasn't a test
+    upload.
+    """
+    with httpx.Client(timeout=30) as client:
+        r = client.delete(f"{OC_BASE}/files/{file_id}", headers=_headers())
+        _raise_with_body(r)
+        try:
+            return _ok(r.json())
+        except Exception:
+            return _ok({"status": "deleted", "file_id": file_id})
 
 
 # ===========================================================================
@@ -203,9 +301,9 @@ if __name__ == "__main__":
             raise RuntimeError(
                 "MCP_AUTH_TOKEN is not set. Refusing to start a remote (Streamable "
                 "HTTP) deployment without an auth token -- this connector exposes "
-                "real client/prospect data, and running unauthenticated would "
-                "leave it open to anyone with the URL. Set MCP_AUTH_TOKEN and "
-                "redeploy."
+                "real client/prospect data and can now upload/delete files, and "
+                "running unauthenticated would leave it open to anyone with the "
+                "URL. Set MCP_AUTH_TOKEN and redeploy."
             )
 
         class BearerAuthMiddleware(BaseHTTPMiddleware):
