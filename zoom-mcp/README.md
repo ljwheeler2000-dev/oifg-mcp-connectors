@@ -4,8 +4,12 @@ MCP connector for Zoom Cloud Recordings and AI Companion meeting summaries — l
 
 ## Requirements
 
-- A Zoom Server-to-Server OAuth app (Zoom App Marketplace -> Build App -> Server-to-Server OAuth) with cloud recording scopes (and `meeting_summary:read:admin` if you want the meeting-summary tools)
+- A Zoom Server-to-Server OAuth app (Zoom App Marketplace -> Build App -> Server-to-Server OAuth) with cloud recording scopes (and `meeting_summary:read:admin` if you want the meeting-summary tools — note this scope's reliability specifically on Server-to-Server apps is unconfirmed; test it live rather than assuming)
 - A Railway account
+
+## What this can't do
+
+`get_meeting_summary` only ever returns Zoom's AI-generated abstract (key takeaways/action items) — never a verbatim transcript. That AI summary feature also has to be turned on at the account level ("Meeting summary with AI" in Zoom's admin settings) before any summary exists to fetch, and it's off by default. Separately, Zoom's auto-record doesn't reliably trigger for real client meetings, so a recording this connector could pull may simply not exist unless someone started it manually; and two meetings held back-to-back in the same Personal Meeting Room can merge into a single continuous recording with no automatic split between them. In practice, treat this connector as a fallback transcript source rather than the primary one — a live meeting-notes capture tends to be more complete.
 
 ## Deploy
 

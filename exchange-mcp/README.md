@@ -7,6 +7,10 @@ MCP connector for a Smarsh-hosted Microsoft Exchange mailbox (EWS) — email, ca
 - A Smarsh-hosted Exchange mailbox (username + password — this uses EWS Basic Auth, not OAuth)
 - A Railway account (or any host that can run a small Python container)
 
+## What this can't do
+
+`exchange_create_calendar_event` will throw a type error if you pass attendees at creation time — create the event first with no attendees, then call `exchange_add_attendees` (event_id, attendees[]) right after. That two-step flow is fully working; there's no need to have anyone forward an invite manually. Beyond that, this connector covers full calendar/contact CRUD and the full email lifecycle (read, search, send, reply, forward, draft, folder/category/flag management) — there's no other known gap in what it exposes versus what EWS supports.
+
 ## Deploy
 
 1. Fork or clone this repo, deploy to Railway with **Root Directory** set to `exchange-mcp`.
