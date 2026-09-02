@@ -7,9 +7,10 @@ MCP (Model Context Protocol) connectors for financial advisor tooling, built for
 | Folder | Wraps | Auth |
 |---|---|---|
 | [`exchange-mcp`](./exchange-mcp) | Smarsh-hosted Microsoft Exchange (EWS) — email, calendar, contacts | EWS username/password |
-| [`zoom-mcp`](./zoom-mcp) | Zoom Cloud Recordings + AI Companion meeting summaries | Zoom Server-to-Server OAuth |
 | [`advisor-evolution-mcp`](./advisor-evolution-mcp) | Advisor Evolution (app.advisorevolution.io) Workspace API — pipeline, business, training, coaching | Static bearer token from AE's "Connect my AI" |
 | [`oneconnect-mcp`](./oneconnect-mcp) | OneConnect.pro (firm CRM) — accounts, prospects, tasks, meetings, contacts, clients, files | Static bearer token from OneConnect Settings -> API Tokens |
+
+**Looking for Zoom?** There's no `zoom-mcp` connector here anymore — it's been retired in favor of Anthropic's first-party "Zoom for Claude" connector, which covers Cloud Recordings, transcripts, AI Companion summaries, and My Notes (the AI Companion notetaker transcript) with a broader, actively maintained API. Connect it directly from Claude's Settings → Connectors rather than deploying anything from this repo.
 
 ## Capabilities & limitations
 
@@ -19,11 +20,6 @@ Every connector here is a thin wrapper over its vendor's own API — if the vend
 **Can:** read/search/send/reply/forward/draft email; full calendar CRUD; full contact CRUD; add attendees to an *existing* event via `exchange_add_attendees`.
 **Cannot:** add attendees in the same call that creates an event — `exchange_create_calendar_event` throws a type error if attendees are passed at creation. Create the event first, then call `exchange_add_attendees` immediately after.
 **Known limitation:** wraps EWS Basic Auth (username/password) against a Smarsh-hosted mailbox specifically — not OAuth, not a generic Exchange/Office 365 setup. A login from a new IP/datacenter can occasionally trip a mail provider's security posture; test live after deploy.
-
-### zoom-mcp (recordings / transcripts / summaries)
-**Can:** list recent cloud recordings, pull transcripts, mark/unmark recordings as processed, list and fetch AI Companion meeting summaries.
-**Cannot:** return a verbatim transcript from `get_meeting_summary` — it only ever returns Zoom's AI-generated abstract (key takeaways/action items), never transcript text.
-**Known limitations:** meeting summaries require the account-level "Meeting summary with AI" setting, off by default and admin-controlled; Zoom's auto-record doesn't reliably trigger for real client meetings, so a recording may simply not exist unless started manually; back-to-back meetings sharing one Personal Meeting Room merge into a single continuous recording with no automatic splitting. In practice this API is a fallback transcript source, not the primary one.
 
 ### advisor-evolution-mcp (pipeline / training / coaching)
 **Can:** read and create/update pipeline relationships, advance a relationship's stage, list joint-work partners, read business snapshot/training/coaching status, mark training assignments complete.
@@ -54,7 +50,7 @@ Each connector folder is independently deployable. See that folder's own README 
      }
    }
    ```
-   Replace `<connector-name>` with whatever you want it labeled (e.g. `exchange`, `zoom`, `advisor-evolution`, `oneconnect`), and repeat the block per connector you deploy — they all merge under the same `mcpServers` key.
+   Replace `<connector-name>` with whatever you want it labeled (e.g. `exchange`, `advisor-evolution`, `oneconnect`), and repeat the block per connector you deploy — they all merge under the same `mcpServers` key.
 
    If your Claude Desktop build doesn't support the `"type": "http"` remote format natively, use the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge instead — point it at the same URL and token via its `--header` flag, and point Claude Desktop's config at the `mcp-remote` command rather than the URL directly. See that package's README for the exact `command`/`args` shape.
 4. Restart Claude Desktop.
