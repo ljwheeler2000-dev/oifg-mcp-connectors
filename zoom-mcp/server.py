@@ -93,34 +93,6 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {_get_token()}"}
 
 
-# ---------------------------------------------------------------------------
-# One-time startup diagnostic (temporary) -- logs Cloud Recording settings to
-# the deploy logs at boot, so this can be checked via Railway's `get-logs`
-# without needing a live MCP tool call (useful right after a fresh deploy,
-# before any client has reconnected). Safe to remove once the empty-
-# recordings issue is resolved; never raises -- a failure here must not
-# block server startup.
-# ---------------------------------------------------------------------------
-try:
-    with httpx.Client(timeout=30) as _diag_client:
-        _profile_r = _diag_client.get(f"https://api.zoom.us/v2/users/{ZOOM_USER_ID}", headers=_headers())
-        _settings_r = _diag_client.get(f"https://api.zoom.us/v2/users/{ZOOM_USER_ID}/settings", headers=_headers())
-    _profile = _profile_r.json() if _profile_r.status_code < 400 else {"error": _profile_r.status_code, "body": _profile_r.text}
-    _settings = _settings_r.json() if _settings_r.status_code < 400 else {"error": _settings_r.status_code, "body": _settings_r.text}
-    _rec = _settings.get("recording", {}) if isinstance(_settings, dict) else {}
-    print("ZOOM_WHOAMI_DIAG " + json.dumps({
-        "configured_zoom_user_id": ZOOM_USER_ID,
-        "resolved_id": _profile.get("id"),
-        "resolved_email": _profile.get("email"),
-        "plan_type": _profile.get("type"),
-        "cloud_recording_enabled": _rec.get("cloud_recording"),
-        "auto_recording": _rec.get("auto_recording"),
-        "record_audio_transcript": _rec.get("record_audio_transcript"),
-    }))
-except Exception as _diag_e:
-    print("ZOOM_WHOAMI_DIAG_ERROR " + str(_diag_e))
-
-
 def _ok(data) -> str:
     return json.dumps(data, indent=2, default=str)
 
@@ -244,32 +216,50 @@ def zoom_whoami() -> str:
     Also reports the user's Zoom plan type, since Cloud Recording requires
     a Licensed (paid) plan -- a Basic/free license can't use it at all,
     account setting or not.
+
+    The profile lookup (GET /v2/users/{userId}) and the settings lookup
+    (GET /v2/users/{userId}/settings) need different OAuth scopes on the
+    Server-to-Server app (roughly user:read:user and user:read:settings /
+    user:read:user:admin respectively). They're fetched independently here
+    so that a missing scope on one doesn't hide a working result from the
+    other -- if a section below shows "_error" instead of real data, add
+    the missing scope to this app in the Zoom App Marketplace (Server-to-
+    Server OAuth app > Scopes) and reactivate the app for it to take effect.
     """
-    with httpx.Client(timeout=30) as client:
-        profile_r = client.get(f"https://api.zoom.us/v2/users/{ZOOM_USER_ID}", headers=_headers())
-        _raise_with_body(profile_r)
-        profile = profile_r.json()
-
-        settings_r = client.get(f"https://api.zoom.us/v2/users/{ZOOM_USER_ID}/settings", headers=_headers())
-        _raise_with_body(settings_r)
-        settings = settings_r.json()
-
-    recording = settings.get("recording", {})
     plan_type_map = {1: "Basic (free -- Cloud Recording not available)", 2: "Licensed (paid)", 3: "On-prem"}
 
-    return _ok({
-        "configured_zoom_user_id": ZOOM_USER_ID,
-        "resolved_user": {
+    try:
+        with httpx.Client(timeout=30) as client:
+            profile_r = client.get(f"https://api.zoom.us/v2/users/{ZOOM_USER_ID}", headers=_headers())
+            _raise_with_body(profile_r)
+            profile = profile_r.json()
+        resolved_user = {
             "id": profile.get("id"),
             "email": profile.get("email"),
             "plan_type": plan_type_map.get(profile.get("type"), profile.get("type")),
-        },
-        "recording_settings": {
+        }
+    except Exception as e:
+        resolved_user = {"_error": str(e)}
+
+    try:
+        with httpx.Client(timeout=30) as client:
+            settings_r = client.get(f"https://api.zoom.us/v2/users/{ZOOM_USER_ID}/settings", headers=_headers())
+            _raise_with_body(settings_r)
+            settings = settings_r.json()
+        recording = settings.get("recording", {})
+        recording_settings = {
             "cloud_recording_enabled": recording.get("cloud_recording"),
             "auto_recording": recording.get("auto_recording"),
             "record_audio_transcript": recording.get("record_audio_transcript"),
             "save_chat_text": recording.get("save_chat_text"),
-        },
+        }
+    except Exception as e:
+        recording_settings = {"_error": str(e)}
+
+    return _ok({
+        "configured_zoom_user_id": ZOOM_USER_ID,
+        "resolved_user": resolved_user,
+        "recording_settings": recording_settings,
         "read_this_as": (
             "If cloud_recording_enabled is false, that alone explains empty "
             "results from list_recent_recordings/get_meeting_transcript -- "
@@ -278,7 +268,13 @@ def zoom_whoami() -> str:
             "Settings > Recording, either for this user or account-wide "
             "depending on who administers this Zoom account. If "
             "auto_recording is 'none', recordings also won't happen unless "
-            "someone manually starts Cloud Recording in each meeting."
+            "someone manually starts Cloud Recording in each meeting. If "
+            "cloud_recording_enabled is true but list_recent_recordings is "
+            "still empty, the setting was likely turned on only recently -- "
+            "check the Recordings & Transcripts page "
+            "(https://zoom.us/recording) for the date of the most recent "
+            "cloud recording; nothing before that date can ever appear no "
+            "matter what this connector does, since Zoom never captured it."
         ),
     })
 
