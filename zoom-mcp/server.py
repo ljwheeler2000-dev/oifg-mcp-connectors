@@ -93,6 +93,34 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {_get_token()}"}
 
 
+# ---------------------------------------------------------------------------
+# One-time startup diagnostic (temporary) -- logs Cloud Recording settings to
+# the deploy logs at boot, so this can be checked via Railway's `get-logs`
+# without needing a live MCP tool call (useful right after a fresh deploy,
+# before any client has reconnected). Safe to remove once the empty-
+# recordings issue is resolved; never raises -- a failure here must not
+# block server startup.
+# ---------------------------------------------------------------------------
+try:
+    with httpx.Client(timeout=30) as _diag_client:
+        _profile_r = _diag_client.get(f"https://api.zoom.us/v2/users/{ZOOM_USER_ID}", headers=_headers())
+        _settings_r = _diag_client.get(f"https://api.zoom.us/v2/users/{ZOOM_USER_ID}/settings", headers=_headers())
+    _profile = _profile_r.json() if _profile_r.status_code < 400 else {"error": _profile_r.status_code, "body": _profile_r.text}
+    _settings = _settings_r.json() if _settings_r.status_code < 400 else {"error": _settings_r.status_code, "body": _settings_r.text}
+    _rec = _settings.get("recording", {}) if isinstance(_settings, dict) else {}
+    print("ZOOM_WHOAMI_DIAG " + json.dumps({
+        "configured_zoom_user_id": ZOOM_USER_ID,
+        "resolved_id": _profile.get("id"),
+        "resolved_email": _profile.get("email"),
+        "plan_type": _profile.get("type"),
+        "cloud_recording_enabled": _rec.get("cloud_recording"),
+        "auto_recording": _rec.get("auto_recording"),
+        "record_audio_transcript": _rec.get("record_audio_transcript"),
+    }))
+except Exception as _diag_e:
+    print("ZOOM_WHOAMI_DIAG_ERROR " + str(_diag_e))
+
+
 def _ok(data) -> str:
     return json.dumps(data, indent=2, default=str)
 
