@@ -599,6 +599,351 @@ def delete_record(kind: str, record_id: int, confirm_title: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Full catalog coverage (from GET /api/docs, 2026-10-29). Request bodies are
+# not documented by OneConnect, so each write takes the common named fields
+# plus `extra` (merged into the JSON body) for anything else. Errors return
+# the vendor's body so a wrong field name is visible immediately.
+# ---------------------------------------------------------------------------
+
+def _body(named: dict, extra: Optional[dict]) -> dict:
+    return {**_clean(named), **(extra or {})}
+
+
+# --- Clients: single-record reads and pipeline actions ---------------------
+
+@mcp.tool()
+def get_client(client_id: int) -> str:
+    """Fetch one /clients (pipeline) record by id."""
+    return _ok(_get(f"/clients/{client_id}"))
+
+
+@mcp.tool()
+def move_client_stage(client_id: int, stage: str, extra: Optional[dict] = None) -> str:
+    """
+    Move a client's pipeline stage via POST /clients/{id}/stage
+    (discovery/proposal/underwriting/issued/lost). update_client with
+    {"stage": ...} also works; this is OneConnect's dedicated route.
+    """
+    return _ok(_send("POST", f"/clients/{client_id}/stage", _body({"stage": stage}, extra)))
+
+
+@mcp.tool()
+def archive_client(client_id: int, extra: Optional[dict] = None) -> str:
+    """Archive a client (POST /clients/{id}/archive). The supported way to retire a pipeline record -- delete is admin-only."""
+    return _ok(_send("POST", f"/clients/{client_id}/archive", _body({}, extra)))
+
+
+@mcp.tool()
+def reassign_client_rep(client_id: int, rep_id: str, extra: Optional[dict] = None) -> str:
+    """Reassign a client's rep (PATCH /clients/{id}/rep). rep_id is a user id from list_users."""
+    return _ok(_send("PATCH", f"/clients/{client_id}/rep", _body({"assigned_rep_id": rep_id, "rep_id": rep_id}, extra)))
+
+
+@mcp.tool()
+def list_client_shares(client_id: int) -> str:
+    """Who a client record is shared with (e.g. joint-work partners)."""
+    return _ok(_get(f"/clients/{client_id}/shares"))
+
+
+@mcp.tool()
+def share_client(client_id: int, user_id: str, extra: Optional[dict] = None) -> str:
+    """Share a client record with another OneConnect user (POST /clients/{id}/shares), e.g. a JWP. user_id from list_users."""
+    return _ok(_send("POST", f"/clients/{client_id}/shares", _body({"user_id": user_id}, extra)))
+
+
+@mcp.tool()
+def unshare_client(client_id: int, user_id: str) -> str:
+    """Remove a user's share on a client record."""
+    return _ok(_send("DELETE", f"/clients/{client_id}/shares/{user_id}", {}))
+
+
+@mcp.tool()
+def list_client_portal_users(client_id: int) -> str:
+    """The client's portal users (GET /clients/{id}/users)."""
+    return _ok(_get(f"/clients/{client_id}/users"))
+
+
+# --- Contacts ---------------------------------------------------------------
+
+@mcp.tool()
+def create_contact(
+    name: str,
+    client_id: Optional[int] = None,
+    account_id: Optional[str] = None,
+    email: Optional[str] = None,
+    phone: Optional[str] = None,
+    title: Optional[str] = None,
+    company: Optional[str] = None,
+    notes: Optional[str] = None,
+    dob: Optional[str] = None,
+    extra: Optional[dict] = None,
+) -> str:
+    """
+    Create a OneConnect contact (a person). Link it to a pipeline record
+    with client_id and/or a household with account_id -- this is how a
+    pipeline-only person (e.g. an Advisor Evolution-synced client) becomes
+    findable as a contact. dob is YYYY-MM-DD.
+    """
+    return _ok(_send("POST", "/contacts", _body({
+        "name": name, "client_id": client_id, "account_id": account_id, "email": email,
+        "phone": phone, "title": title, "company": company, "notes": notes, "dob": dob,
+    }, extra)))
+
+
+@mcp.tool()
+def update_contact(contact_id: int, fields: dict) -> str:
+    """Update a contact (PATCH /contacts/{id}), e.g. {"email": "...", "client_id": 24583}."""
+    return _ok(_send("PATCH", f"/contacts/{contact_id}", fields))
+
+
+@mcp.tool()
+def delete_contact(contact_id: int, confirm_name: str) -> str:
+    """Permanently delete a contact. confirm_name must exactly match the contact's name. No undo."""
+    _, records, _ = _list_all("/contacts", None, True)
+    rec = next((r for r in records if str(r.get("id")) == str(contact_id)), None)
+    if rec is None:
+        raise ValueError(f"contact {contact_id} not found; nothing deleted")
+    if rec.get("name") != confirm_name:
+        raise ValueError(f"confirm_name mismatch: contact {contact_id} is {rec.get('name')!r}; nothing deleted")
+    return _ok(_send("DELETE", f"/contacts/{contact_id}", {}))
+
+
+# --- Notes & next steps -----------------------------------------------------
+
+@mcp.tool()
+def list_notes(client_id: int) -> str:
+    """Notes on a client record (GET /notes?client_id=)."""
+    return _ok(_get("/notes", {"client_id": client_id}))
+
+
+@mcp.tool()
+def create_note(client_id: int, content: str, title: Optional[str] = None, extra: Optional[dict] = None) -> str:
+    """
+    Add a note to a client record -- e.g. a meeting summary, since
+    create_meeting still 500s. Sent as {"client_id", "content", "title"};
+    if OneConnect wants a different field name, pass it via extra.
+    """
+    return _ok(_send("POST", "/notes", _body({
+        "client_id": client_id, "content": content, "title": title,
+    }, extra)))
+
+
+@mcp.tool()
+def update_note(note_id: int, fields: dict) -> str:
+    """Update a note (PATCH /notes/{id})."""
+    return _ok(_send("PATCH", f"/notes/{note_id}", fields))
+
+
+@mcp.tool()
+def delete_note(note_id: int) -> str:
+    """Permanently delete a note (DELETE /notes/{id}). No undo."""
+    return _ok(_send("DELETE", f"/notes/{note_id}", {}))
+
+
+@mcp.tool()
+def list_next_steps(client_id: int) -> str:
+    """Next-step entries for a client (GET /next-steps?client_id= -- client_id is required)."""
+    return _ok(_get("/next-steps", {"client_id": client_id}))
+
+
+# --- Meetings: single read / delete ----------------------------------------
+
+@mcp.tool()
+def get_meeting(meeting_id: int) -> str:
+    """Fetch one meeting by id."""
+    return _ok(_get(f"/meetings/{meeting_id}"))
+
+
+# --- Subtasks & checklists ---------------------------------------------------
+
+@mcp.tool()
+def list_subtasks(task_id: int) -> str:
+    """Subtasks of a task (GET /subtasks?task_id=)."""
+    return _ok(_get("/subtasks", {"task_id": task_id}))
+
+
+@mcp.tool()
+def create_subtask(task_id: int, title: str, extra: Optional[dict] = None) -> str:
+    """Add a subtask to a task."""
+    return _ok(_send("POST", "/subtasks", _body({"task_id": task_id, "title": title}, extra)))
+
+
+@mcp.tool()
+def update_subtask(subtask_id: int, fields: dict) -> str:
+    """Update a subtask (PATCH /subtasks/{id}), e.g. {"status": "completed"}."""
+    return _ok(_send("PATCH", f"/subtasks/{subtask_id}", fields))
+
+
+@mcp.tool()
+def delete_subtask(subtask_id: int) -> str:
+    """Delete a subtask. No undo."""
+    return _ok(_send("DELETE", f"/subtasks/{subtask_id}", {}))
+
+
+@mcp.tool()
+def list_checklist(task_id: int) -> str:
+    """Checklist items on a task (GET /checklist?task_id=)."""
+    return _ok(_get("/checklist", {"task_id": task_id}))
+
+
+@mcp.tool()
+def create_checklist_item(task_id: int, title: str, extra: Optional[dict] = None) -> str:
+    """Add a checklist item to a task."""
+    return _ok(_send("POST", "/checklist", _body({"task_id": task_id, "title": title}, extra)))
+
+
+@mcp.tool()
+def update_checklist_item(item_id: int, fields: dict) -> str:
+    """Update/check a checklist item (PATCH /checklist/{id}), e.g. {"completed": true}."""
+    return _ok(_send("PATCH", f"/checklist/{item_id}", fields))
+
+
+@mcp.tool()
+def delete_checklist_item(item_id: int) -> str:
+    """Delete a checklist item. No undo."""
+    return _ok(_send("DELETE", f"/checklist/{item_id}", {}))
+
+
+# --- Client status reports -------------------------------------------------
+
+@mcp.tool()
+def list_status_reports() -> str:
+    """Client status reports (GET /reports/status)."""
+    return _ok(_get("/reports/status"))
+
+
+@mcp.tool()
+def generate_status_report(client_id: int, extra: Optional[dict] = None) -> str:
+    """Generate a client status report (POST /reports/status/generate). Not published to the client until status_report_action(report_id, "publish")."""
+    return _ok(_send("POST", "/reports/status/generate", _body({"client_id": client_id}, extra)))
+
+
+@mcp.tool()
+def update_status_report(report_id: int, fields: dict) -> str:
+    """Update a status report (PATCH /reports/status/{id})."""
+    return _ok(_send("PATCH", f"/reports/status/{report_id}", fields))
+
+
+@mcp.tool()
+def status_report_action(report_id: int, action: str) -> str:
+    """
+    Run a lifecycle action on a status report: "publish" (sends it to the
+    client's portal -- client-facing, confirm with the advisor first),
+    "retract", "regenerate", or "delete".
+    """
+    if action == "delete":
+        return _ok(_send("DELETE", f"/reports/status/{report_id}", {}))
+    if action not in ("publish", "retract", "regenerate"):
+        raise ValueError("action must be publish, retract, regenerate or delete")
+    return _ok(_send("POST", f"/reports/status/{report_id}/{action}", {}))
+
+
+# --- Analytics & team (read-only) -------------------------------------------
+
+_ANALYTICS = {
+    "stats": "/stats", "revenue": "/revenue", "activity": "/activity",
+    "financials": "/financials", "health_score": "/health-score",
+}
+
+
+@mcp.tool()
+def get_analytics(kind: str, params: Optional[dict] = None) -> str:
+    """
+    Read a OneConnect dashboard: kind is stats, revenue, activity,
+    financials or health_score. For one record's activity use
+    get_entity_activity.
+    """
+    if kind not in _ANALYTICS:
+        raise ValueError(f"kind must be one of {sorted(_ANALYTICS)}")
+    return _ok(_get(_ANALYTICS[kind], params))
+
+
+@mcp.tool()
+def get_entity_activity(params: dict) -> str:
+    """Activity for one record (GET /activity/entity), e.g. {"entity_type": "client", "entity_id": 24583}."""
+    return _ok(_get("/activity/entity", params))
+
+
+@mcp.tool()
+def list_users(query: Optional[str] = None) -> str:
+    """
+    The OneConnect user directory (ids, names, emails, roles, office) --
+    needed for task assignees, rep reassignment and sharing. `query`
+    filters by name/email substring locally.
+    """
+    users = _get("/users")
+    if isinstance(users, dict):
+        users, _, _ = _split(users)
+    keep = ("id", "name", "email", "role", "tenant_role", "office_id", "is_active")
+    out = [{k: u.get(k) for k in keep} for u in users]
+    if query:
+        q = query.lower()
+        out = [u for u in out if q in (u.get("name") or "").lower() or q in (u.get("email") or "").lower()]
+    return _ok({"count": len(out), "users": out})
+
+
+@mcp.tool()
+def list_offices() -> str:
+    """The office directory (Indy, Evansville, Louisville, Florida, ...)."""
+    return _ok(_get("/offices"))
+
+
+# --- Files: OneConnect's documented presign/finalize upload ------------------
+
+@mcp.tool()
+def get_file_download_url(file_id: int) -> str:
+    """Short-lived download URL for a scanned file (GET /files/{id}/download-url)."""
+    return _ok(_get(f"/files/{file_id}/download-url"))
+
+
+def _find(d, *keys):
+    if isinstance(d, dict):
+        for k in keys:
+            if d.get(k):
+                return d[k]
+        for v in d.values():
+            hit = _find(v, *keys)
+            if hit:
+                return hit
+    return None
+
+
+@mcp.tool()
+def upload_file_scanned(
+    filename: str,
+    content_base64: str,
+    mime_type: str = "text/plain",
+    client_id: Optional[int] = None,
+    extra: Optional[dict] = None,
+) -> str:
+    """
+    Upload via OneConnect's documented flow: presign -> PUT to storage ->
+    finalize (which triggers the virus scan, so the file leaves
+    pending_upload). Prefer this over upload_file once verified. Returns
+    each step's raw response so a field-name mismatch is visible.
+    """
+    raw = base64.b64decode(content_base64)
+    steps = {}
+    pre = _send("POST", "/files/presign-upload", _body({
+        "filename": filename, "name": filename, "mime_type": mime_type,
+        "content_type": mime_type, "size_bytes": len(raw), "size": len(raw),
+        "client_id": client_id,
+    }, extra))
+    steps["presign"] = pre
+    url = _find(pre, "upload_url", "uploadUrl", "presigned_url", "url", "signedUrl")
+    file_id = _find(pre, "file_id", "fileId", "id")
+    if not url or not file_id:
+        return _ok({"error": "presign response missing upload url or file id", "steps": steps})
+    with httpx.Client(timeout=120) as client:
+        put = client.put(url, content=raw, headers={"Content-Type": mime_type})
+    steps["put"] = {"status": put.status_code, "body": put.text[:500]}
+    if put.status_code >= 400:
+        return _ok({"error": "storage PUT failed", "steps": steps})
+    steps["finalize"] = _send("POST", f"/files/{file_id}/finalize", {})
+    return _ok({"file_id": file_id, "steps": steps})
+
+
+# ---------------------------------------------------------------------------
 # Files -- the one place write access is confirmed working. Upload requires
 # multipart/form-data; a plain JSON POST 500s.
 # ---------------------------------------------------------------------------
