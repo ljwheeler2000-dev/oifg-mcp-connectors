@@ -581,14 +581,20 @@ def update_client(client_id: int, fields: dict) -> str:
 @mcp.tool()
 def delete_record(kind: str, record_id: int, confirm_title: str) -> str:
     """
-    Permanently delete a task or meeting -- intended for removing test
-    records. kind is "tasks" or "meetings". confirm_title must exactly
-    equal the record's title, as a guard against deleting the wrong id.
-    Clients can't be deleted through the API (403 insufficient_scope) --
-    set their stage to "lost" with update_client instead. No undo.
+    Permanently delete a meeting -- intended for removing test records.
+    kind must be "meetings". confirm_title must exactly equal the record's
+    title, as a guard against deleting the wrong id. No undo.
+
+    Tasks can't be deleted: the catalog has no DELETE /tasks/{id} and the
+    call returns 403 insufficient_scope (live-tested 2026-10-29). Mark a
+    stray task completed with update_task instead. Clients can't be
+    deleted or archived either (both 403) -- set their stage to "lost"
+    with update_client.
     """
-    if kind not in ("tasks", "meetings"):
-        raise ValueError("kind must be tasks or meetings (clients have no delete scope)")
+    if kind == "tasks":
+        raise ValueError("tasks can't be deleted via the API (403); use update_task(id, {'status': 'completed'})")
+    if kind != "meetings":
+        raise ValueError("kind must be meetings (tasks/clients have no delete scope)")
     _, records, _ = _list_all(f"/{kind}", None, True)
     rec = next((r for r in records if str(r.get("id")) == str(record_id)), None)
     if rec is None:
@@ -629,7 +635,11 @@ def move_client_stage(client_id: int, stage: str, extra: Optional[dict] = None) 
 
 @mcp.tool()
 def archive_client(client_id: int, extra: Optional[dict] = None) -> str:
-    """Archive a client (POST /clients/{id}/archive). The supported way to retire a pipeline record -- delete is admin-only."""
+    """
+    Archive a client (POST /clients/{id}/archive). Returns 403
+    insufficient_scope for an advisor token (live-tested 2026-10-29) --
+    to retire a pipeline record, use update_client(id, {"stage": "lost"}).
+    """
     return _ok(_send("POST", f"/clients/{client_id}/archive", _body({}, extra)))
 
 
@@ -683,6 +693,9 @@ def create_contact(
     with client_id and/or a household with account_id -- this is how a
     pipeline-only person (e.g. an Advisor Evolution-synced client) becomes
     findable as a contact. dob is YYYY-MM-DD.
+
+    KNOWN VENDOR BUG (2026-10-29): POST /contacts returns 500 "Failed to
+    create contact" even with only {"name"} -- not a field-name issue.
     """
     return _ok(_send("POST", "/contacts", _body({
         "name": name, "client_id": client_id, "account_id": account_id, "email": email,
@@ -722,6 +735,10 @@ def create_note(client_id: int, content: str, title: Optional[str] = None, extra
     Add a note to a client record -- e.g. a meeting summary, since
     create_meeting still 500s. Sent as {"client_id", "content", "title"};
     if OneConnect wants a different field name, pass it via extra.
+
+    KNOWN VENDOR BUG (2026-10-29): POST /notes returns 500 "Failed to
+    create note" (with or without title). Use upload_file_scanned with
+    client_id for meeting summaries until OneConnect fixes it.
     """
     return _ok(_send("POST", "/notes", _body({
         "client_id": client_id, "content": content, "title": title,
@@ -770,7 +787,7 @@ def create_subtask(task_id: int, title: str, extra: Optional[dict] = None) -> st
 
 @mcp.tool()
 def update_subtask(subtask_id: int, fields: dict) -> str:
-    """Update a subtask (PATCH /subtasks/{id}), e.g. {"status": "completed"}."""
+    """Update a subtask (PATCH /subtasks/{id}), e.g. {"is_completed": true} or {"title": "..."}."""
     return _ok(_send("PATCH", f"/subtasks/{subtask_id}", fields))
 
 
@@ -781,20 +798,24 @@ def delete_subtask(subtask_id: int) -> str:
 
 
 @mcp.tool()
-def list_checklist(task_id: int) -> str:
-    """Checklist items on a task (GET /checklist?task_id=)."""
-    return _ok(_get("/checklist", {"task_id": task_id}))
+def list_checklist(client_id: int) -> str:
+    """
+    Checklist items on a client record (GET /checklist?client_id=).
+    Checklists belong to /clients, not tasks -- ?task_id= returns 400
+    "client_id required" (live-tested 2026-10-29).
+    """
+    return _ok(_get("/checklist", {"client_id": client_id}))
 
 
 @mcp.tool()
-def create_checklist_item(task_id: int, title: str, extra: Optional[dict] = None) -> str:
-    """Add a checklist item to a task."""
-    return _ok(_send("POST", "/checklist", _body({"task_id": task_id, "title": title}, extra)))
+def create_checklist_item(client_id: int, title: str, extra: Optional[dict] = None) -> str:
+    """Add a checklist item to a client record (POST /checklist with client_id + title)."""
+    return _ok(_send("POST", "/checklist", _body({"client_id": client_id, "title": title}, extra)))
 
 
 @mcp.tool()
 def update_checklist_item(item_id: int, fields: dict) -> str:
-    """Update/check a checklist item (PATCH /checklist/{id}), e.g. {"completed": true}."""
+    """Update/check a checklist item (PATCH /checklist/{id}), e.g. {"is_completed": true}."""
     return _ok(_send("PATCH", f"/checklist/{item_id}", fields))
 
 
