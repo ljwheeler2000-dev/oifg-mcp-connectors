@@ -29,6 +29,18 @@ This connector only exposes what's actually been tested against a live OneConnec
 
 **Endpoint catalog:** OneConnect publishes an authenticated catalog at `GET /api/docs` (scopes, paging rules, every path). Read it with `api_get("/docs", max_chars=60000)` or page through it with `body_offset`. Paged endpoints take `?limit=&offset=` and return `X-Has-More`.
 
+**Full catalog tools (added 2026-10-29, writes not yet live-verified):**
+- **Contacts:** `create_contact` (link to a client with `client_id` or a household with `account_id`), `update_contact`, and `delete_contact` (name-guarded).
+- **Notes:** `list_notes`, `create_note`, `update_note` and `delete_note`; plus `list_next_steps`.
+- **Clients:** `get_client`, `move_client_stage`, `archive_client`, `reassign_client_rep`, `list_client_shares`, `share_client`, `unshare_client` and `list_client_portal_users`.
+- **Tasks:** `list_subtasks`, `create_subtask`, `update_subtask`, `delete_subtask`, `list_checklist`, `create_checklist_item`, `update_checklist_item` and `delete_checklist_item`.
+- **Meetings:** `get_meeting`.
+- **Status reports:** `list_status_reports`, `generate_status_report` and `update_status_report`; `status_report_action` (publish/retract/regenerate/delete). **Publish is client-facing.**
+- **Analytics and team:** `get_analytics` (stats/revenue/activity/financials/health_score), `get_entity_activity`, `list_users` and `list_offices`.
+- **Files:** `get_file_download_url`, and `upload_file_scanned`, which uses OneConnect's presign → PUT → finalize flow and triggers the virus scan.
+
+Request bodies aren't documented by OneConnect. Every write takes the common fields plus `extra` for anything else, and returns the vendor's error body if a field name is wrong. Planner (`/planner/*`) and QA (`/scrum/qa/*`) are 404 on this tenant (modules off), so they have no tools; use `api_get` if they're ever enabled.
+
 **A caution on trusting "Fixed" labels:** OneConnect's own support tracker marked ticket OC-176 (a request to add write scopes for accounts/prospects) "Fixed." Live re-testing on 2026-09-01 shows it isn't — those write paths still don't exist. Don't assume a vendor ticket status reflects reality; re-test with `check_connection()` and a real attempt before relying on anything that was previously reported broken.
 
 **Routing note:** some OneConnect endpoints are tenant-scoped in the URL (`/{tenant}/accounts`, `/{tenant}/prospects`) and others are top-level (`/tasks`, `/meetings`, `/contacts`, `/clients`, `/files`). That's how OneConnect built their API — this connector follows it as-is rather than normalizing it.
