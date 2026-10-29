@@ -22,21 +22,24 @@ WRITE SUPPORT STATUS (last verified live against the vendor's API on
     route to real endpoints, but every create attempt returns a clean
     500 (no partial record left behind) -- confirmed broken on
     OneConnect's backend, reported to the vendor with correlation IDs.
-    create_*/update_* tools now exist (2026-10-29) so this can be
-    re-verified on demand and so they work the day the vendor fixes it;
-    errors return the vendor body + trace headers for the support ticket.
+    RE-TESTED 2026-10-29: tasks and clients create + update now WORK.
+    meetings create still 500s ("Failed to create meeting", with a
+    correlationId). Task updates ignore account_id; DELETE /clients/{id}
+    is 403 insufficient_scope (no delete scope); GET /tasks/{id} is 405.
   - files:write DOES work, but only as multipart/form-data -- a plain
     JSON POST to /files also 500s. delete (DELETE /files/{id}) works
     too. Both confirmed with a real create-then-delete round trip.
-  - GET /files (the list endpoint) has 500'd ("Failed to load
-    results") even though GET /files/{id} works. list_files exists and
-    returns the error body if it still fails.
+  - GET /files unfiltered 500s ("Failed to load results"), but
+    GET /files?client_id=N works (2026-10-29). Uploads honor client_id
+    (file lands under clients/N/) but ignore account_id.
   - List endpoints return 50 records per call; the list_* tools now
     follow paging (see _list_all) and report _paging.complete.
 
-Until the vendor fixes writes, anything that "writes" client/task/meeting
-data (e.g. a meeting-notes skill) should treat a 500 from create_* as
-expected, fall back to upload_file, and never claim the write landed.
+Meetings are still not writable: a meeting-notes skill should upload the
+summary as a file linked with client_id instead, and never claim a
+meeting record was written. OneConnect publishes an authenticated endpoint
+catalog at GET /api/docs -- read it with api_get("/docs") when a path or
+payload is in doubt.
 
 Known-flaky endpoints (confirmed against the vendor's own API, subject to
 change -- re-verify against README before assuming these are still
@@ -161,10 +164,12 @@ def _send(method: str, path: str, body: dict):
 _PAGE_SIZE = 50
 _MAX_PAGES = 60
 _PAGING_STYLES = {
+    # Documented in OneConnect's GET /api/docs catalog (2026-10-29): paged
+    # endpoints take ?limit=&offset= and return X-Has-More. Try it first.
+    "offset+limit": lambda i: {"offset": i * _PAGE_SIZE, "limit": _PAGE_SIZE},
     "page+limit": lambda i: {"page": i + 1, "limit": _PAGE_SIZE},
     "page+per_page": lambda i: {"page": i + 1, "per_page": _PAGE_SIZE},
     "page+pageSize": lambda i: {"page": i + 1, "pageSize": _PAGE_SIZE},
-    "offset+limit": lambda i: {"offset": i * _PAGE_SIZE, "limit": _PAGE_SIZE},
     "skip+take": lambda i: {"skip": i * _PAGE_SIZE, "take": _PAGE_SIZE},
 }
 
@@ -278,10 +283,10 @@ def check_connection() -> str:
     result["write_support"] = {
         "accounts": "no write scope exists on the API yet",
         "prospects": "no write scope exists on the API yet",
-        "tasks": "create_task/update_task available -- last known: 500 on create (vendor bug); re-verify",
-        "clients": "create_client/update_client available -- last known: 500 on create (vendor bug); re-verify",
-        "meetings": "create_meeting/update_meeting available -- last known: 500 on create (vendor bug); re-verify",
-        "files": "works -- see upload_file / get_file / delete_file",
+        "tasks": "create/update WORK (2026-10-29); account_id link ignored on update; no GET by id",
+        "clients": "create/update WORK (2026-10-29); delete is 403 (no scope)",
+        "meetings": "create still 500s (vendor bug, correlationId returned); re-verify",
+        "files": "upload/get/delete work; client_id link works, account_id ignored; list works only with ?client_id=",
     }
     return _ok(result)
 
@@ -427,7 +432,7 @@ def find_person(query: str, sources: Optional[list[str]] = None) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def api_get(path: str, params: Optional[dict] = None) -> str:
+def api_get(path: str, params: Optional[dict] = None, max_chars: int = 4000, body_offset: int = 0) -> str:
     """
     Make a read-only GET against any OneConnect API path and return the
     status and (truncated) body. Use it to test whether a scope on the
@@ -435,6 +440,11 @@ def api_get(path: str, params: Optional[dict] = None) -> str:
     endpoint, or to discover query params. `{tenant}` in the path is
     replaced with this connector's tenant slug, e.g. "/{tenant}/planner".
     GET only -- this tool cannot create, change or delete anything.
+
+    Long bodies (e.g. "/docs", OneConnect's authenticated endpoint
+    catalog) are returned in slices: raise max_chars (up to 60000) or page
+    through with body_offset; `next_offset` says where the next slice
+    starts.
     """
     if not path.startswith("/") or ".." in path or "://" in path:
         raise ValueError("path must be an API-relative path like '/reports' or '/{tenant}/planner'")
@@ -446,11 +456,19 @@ def api_get(path: str, params: Optional[dict] = None) -> str:
         preview = json.dumps(body, default=str)
     except Exception:
         preview = r.text
+    max_chars = max(1, min(int(max_chars), 60000))
+    start = max(0, int(body_offset))
+    end = start + max_chars
+    paging_headers = {k: v for k, v in r.headers.items() if k.lower().startswith("x-")}
     return _ok({
         "status": r.status_code,
         "url": str(r.request.url),
-        "body_preview": preview[:4000],
-        "truncated": len(preview) > 4000,
+        "x_headers": paging_headers,
+        "body_length": len(preview),
+        "body_offset": start,
+        "body_preview": preview[start:end],
+        "truncated": len(preview) > end,
+        "next_offset": end if len(preview) > end else None,
     })
 
 
@@ -479,7 +497,8 @@ def create_task(
     priority is low/medium/high; status defaults to OneConnect's own
     default (pending). assigned_to is a OneConnect user id -- omit to let
     OneConnect assign it to the token's owner.
-    Last known state: OneConnect 500s on this (vendor bug). Re-verify.
+    Verified working 2026-10-29. "low" priority came back as "medium" --
+    OneConnect's priority values may differ; check the catalog (api_get "/docs").
     """
     return _ok(_send("POST", "/tasks", _clean({
         "title": title, "description": description, "due_date": due_date,
@@ -512,7 +531,8 @@ def create_meeting(
     Create a OneConnect meeting record -- e.g. to file a meeting summary
     against a household instead of as a loose File Cabinet document.
     meeting_date is ISO 8601 with offset (e.g. "2026-10-29T14:00:00-04:00").
-    Last known state: OneConnect 500s on this (vendor bug). Re-verify.
+    Still 500s as of 2026-10-29 ("Failed to create meeting" + correlationId)
+    -- vendor bug. Fall back to upload_file with client_id.
     """
     return _ok(_send("POST", "/meetings", _clean({
         "title": title, "meeting_date": meeting_date, "duration_minutes": duration_minutes,
@@ -541,8 +561,9 @@ def create_client(
 ) -> str:
     """
     Create a OneConnect /clients (pipeline) record. stage is one of
-    discovery/proposal/underwriting/issued/lost.
-    Last known state: OneConnect 500s on this (vendor bug). Re-verify.
+    discovery/proposal/underwriting/issued/lost. Verified working
+    2026-10-29, as is update_client (stage, deal_value, next_review_date).
+    There is no delete for clients (403); set stage "lost" instead.
     """
     return _ok(_send("POST", "/clients", _clean({
         "company_name": company_name, "contact_name": contact_name or company_name,
@@ -560,20 +581,20 @@ def update_client(client_id: int, fields: dict) -> str:
 @mcp.tool()
 def delete_record(kind: str, record_id: int, confirm_title: str) -> str:
     """
-    Permanently delete a task, meeting or client record -- intended for
-    removing test records created while re-verifying writes. kind is
-    "tasks", "meetings" or "clients". confirm_title must exactly equal the
-    record's title/company_name, as a guard against deleting the wrong id.
-    No undo.
+    Permanently delete a task or meeting -- intended for removing test
+    records. kind is "tasks" or "meetings". confirm_title must exactly
+    equal the record's title, as a guard against deleting the wrong id.
+    Clients can't be deleted through the API (403 insufficient_scope) --
+    set their stage to "lost" with update_client instead. No undo.
     """
-    if kind not in ("tasks", "meetings", "clients"):
-        raise ValueError("kind must be tasks, meetings or clients")
-    rec = _get(f"/{kind}/{record_id}")
-    if isinstance(rec, dict) and isinstance(rec.get("data"), dict):
-        rec = rec["data"]
-    actual = (rec or {}).get("title") or (rec or {}).get("company_name")
-    if actual != confirm_title:
-        raise ValueError(f"confirm_title mismatch: record {record_id} is titled {actual!r}; nothing deleted")
+    if kind not in ("tasks", "meetings"):
+        raise ValueError("kind must be tasks or meetings (clients have no delete scope)")
+    _, records, _ = _list_all(f"/{kind}", None, True)
+    rec = next((r for r in records if str(r.get("id")) == str(record_id)), None)
+    if rec is None:
+        raise ValueError(f"{kind} record {record_id} not found; nothing deleted")
+    if rec.get("title") != confirm_title:
+        raise ValueError(f"confirm_title mismatch: record {record_id} is titled {rec.get('title')!r}; nothing deleted")
     return _ok(_send("DELETE", f"/{kind}/{record_id}", {}))
 
 
@@ -596,10 +617,8 @@ def get_file(file_id: int) -> str:
 @mcp.tool()
 def list_files(params: Optional[dict] = None) -> str:
     """
-    List File Cabinet records. Has historically 500'd on OneConnect's side;
-    if it errors, the error body is returned so it can be reported.
-    `params` is passed through as query-string filters (e.g.
-    {"client_id": 24583}).
+    List File Cabinet records. Pass a filter: {"client_id": 24583} works
+    (2026-10-29); the unfiltered list still 500s on OneConnect's side.
     """
     return _list_tool("/files", params, all_pages=False)
 
@@ -622,9 +641,10 @@ def upload_file(
     ~13.5 KB and split larger documents into parts.
 
     client_id / account_id / meeting_id are sent as form fields to link
-    the file to a record. OneConnect has historically ignored them -- the
-    response's `_link_check` says whether each link actually stuck. If not,
-    put the client name in the filename and body so the file is findable.
+    the file to a record. client_id WORKS (verified 2026-10-29 -- the file
+    is stored under clients/N/ and shows with list_files(client_id=N));
+    account_id is ignored. `_link_check` reports what stuck. Still put the
+    client name in the filename and body.
     """
     raw = base64.b64decode(content_base64)
     files = {"file": (filename, raw, mime_type or "application/octet-stream")}
