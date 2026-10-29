@@ -22,19 +22,21 @@ WRITE SUPPORT STATUS (last verified live against the vendor's API on
     route to real endpoints, but every create attempt returns a clean
     500 (no partial record left behind) -- confirmed broken on
     OneConnect's backend, reported to the vendor with correlation IDs.
-    Do not add create_task/create_client/create_meeting tools until the
-    vendor confirms these actually work; they'll just 500.
+    create_*/update_* tools now exist (2026-10-29) so this can be
+    re-verified on demand and so they work the day the vendor fixes it;
+    errors return the vendor body + trace headers for the support ticket.
   - files:write DOES work, but only as multipart/form-data -- a plain
     JSON POST to /files also 500s. delete (DELETE /files/{id}) works
     too. Both confirmed with a real create-then-delete round trip.
-  - GET /files (the list endpoint) still 500s ("Failed to load
-    results") even though GET /files/{id} for a single record works
-    fine. So there's no list_files tool here -- only get_file(id) for
-    when you already have an id (e.g. from upload_file's response).
+  - GET /files (the list endpoint) has 500'd ("Failed to load
+    results") even though GET /files/{id} works. list_files exists and
+    returns the error body if it still fails.
+  - List endpoints return 50 records per call; the list_* tools now
+    follow paging (see _list_all) and report _paging.complete.
 
-Anything that "writes" client/task/meeting data today (e.g. a
-meeting-notes skill) should still draft the text for the advisor to
-paste into OneConnect by hand -- do not simulate those writes here.
+Until the vendor fixes writes, anything that "writes" client/task/meeting
+data (e.g. a meeting-notes skill) should treat a 500 from create_* as
+expected, fall back to upload_file, and never claim the write landed.
 
 Known-flaky endpoints (confirmed against the vendor's own API, subject to
 change -- re-verify against README before assuming these are still
@@ -105,9 +107,18 @@ KNOWN_BROKEN = ["/team", "/reports", "/analytics", "/scrum", "/files (list)"]
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
+# Response headers worth quoting back to the vendor when something 500s.
+_TRACE_HEADERS = ("x-request-id", "x-correlation-id", "x-vercel-id", "cf-ray", "x-amzn-requestid")
+
+
 def _raise_with_body(r: httpx.Response) -> None:
     if r.status_code >= 400:
-        raise RuntimeError(f"OneConnect API error {r.status_code} for {r.request.url}: {r.text}")
+        trace = {h: r.headers[h] for h in _TRACE_HEADERS if h in r.headers}
+        trace_txt = f" trace={trace}" if trace else ""
+        raise RuntimeError(
+            f"OneConnect API error {r.status_code} for {r.request.method} {r.request.url}: "
+            f"{r.text[:2000]}{trace_txt}"
+        )
 
 
 def _headers() -> dict:
@@ -118,11 +129,115 @@ def _ok(data) -> str:
     return json.dumps(data, indent=2, default=str)
 
 
-def _get(path: str, params: Optional[dict] = None) -> dict:
+def _clean(d: Optional[dict]) -> dict:
+    return {k: v for k, v in (d or {}).items() if v is not None}
+
+
+def _get(path: str, params: Optional[dict] = None):
     with httpx.Client(timeout=30) as client:
-        r = client.get(f"{OC_BASE}{path}", headers=_headers(), params=params)
+        r = client.get(f"{OC_BASE}{path}", headers=_headers(), params=_clean(params))
         _raise_with_body(r)
         return r.json()
+
+
+def _send(method: str, path: str, body: dict):
+    with httpx.Client(timeout=30) as client:
+        r = client.request(method, f"{OC_BASE}{path}", headers=_headers(), json=body)
+        _raise_with_body(r)
+        try:
+            return r.json()
+        except Exception:
+            return {"status": r.status_code, "body": r.text}
+
+
+# ---------------------------------------------------------------------------
+# Paging. OneConnect returns 50 records per call by default (accounts reports
+# total=165 but returns 50) and publishes no docs on its paging params. So we
+# try the common conventions in turn and keep whichever one actually yields
+# new ids, deduping by id. If none do, the result says complete=False rather
+# than pretending the first page is everything.
+# ---------------------------------------------------------------------------
+
+_PAGE_SIZE = 50
+_MAX_PAGES = 60
+_PAGING_STYLES = {
+    "page+limit": lambda i: {"page": i + 1, "limit": _PAGE_SIZE},
+    "page+per_page": lambda i: {"page": i + 1, "per_page": _PAGE_SIZE},
+    "page+pageSize": lambda i: {"page": i + 1, "pageSize": _PAGE_SIZE},
+    "offset+limit": lambda i: {"offset": i * _PAGE_SIZE, "limit": _PAGE_SIZE},
+    "skip+take": lambda i: {"skip": i * _PAGE_SIZE, "take": _PAGE_SIZE},
+}
+
+
+def _split(data):
+    """Return (records, total, list_key) for either a bare list or a {key: [...], total: n} envelope."""
+    if isinstance(data, list):
+        return data, None, None
+    if isinstance(data, dict):
+        total = data.get("total") if isinstance(data.get("total"), int) else data.get("count")
+        for k, v in data.items():
+            if isinstance(v, list) and (not v or isinstance(v[0], dict)):
+                return v, total if isinstance(total, int) else None, k
+    return [], None, None
+
+
+def _rid(rec: dict):
+    return rec.get("id") or json.dumps(rec, sort_keys=True, default=str)
+
+
+def _list_all(path: str, params: Optional[dict] = None, all_pages: bool = True):
+    """Fetch a list endpoint, following pages when all_pages is set. Returns (envelope, records, meta)."""
+    first = _get(path, params)
+    records, total, key = _split(first)
+    meta = {"returned": len(records), "total_reported": total, "paging": None, "complete": None}
+    if not all_pages:
+        meta["complete"] = (total is None or len(records) >= total) if total is not None else None
+        return first, records, meta
+
+    seen = {_rid(r) for r in records}
+    merged = list(records)
+    target = total
+    # Without a reported total, only keep paging if the first page looks full.
+    if (target is not None and len(merged) >= target) or (target is None and len(merged) < _PAGE_SIZE):
+        meta["complete"] = True if target is not None else None
+        return first, merged, meta
+
+    for style, mk in _PAGING_STYLES.items():
+        added_any = False
+        for i in range(1, _MAX_PAGES):
+            try:
+                page = _get(path, {**(params or {}), **mk(i)})
+            except RuntimeError:
+                break
+            recs, _, _ = _split(page)
+            new = [r for r in recs if _rid(r) not in seen]
+            if not new:
+                break
+            added_any = True
+            for r in new:
+                seen.add(_rid(r))
+                merged.append(r)
+            if target is not None and len(merged) >= target:
+                break
+        if added_any:
+            meta["paging"] = style
+            break
+
+    meta["returned"] = len(merged)
+    meta["complete"] = (len(merged) >= target) if target is not None else None
+    return first, merged, meta
+
+
+def _list_tool(path: str, params: Optional[dict], all_pages: bool) -> str:
+    first, records, meta = _list_all(path, params, all_pages)
+    _, _, key = _split(first)
+    if key:
+        out = dict(first)
+        out[key] = records
+    else:
+        out = {"records": records}
+    out["_paging"] = meta
+    return _ok(out)
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +253,9 @@ def check_connection() -> str:
     docstring) -- call this first in any session that will lean on
     OneConnect data, and again if a call unexpectedly fails, rather than
     assuming the last-known status still holds.
+
+    Write support is NOT probed here (that would create records). Use the
+    create_* tools on a clearly-labeled test record to re-verify writes.
     """
     result = {"tenant": OC_TENANT, "base_url": OC_BASE, "endpoints": {}}
     checks = [
@@ -147,6 +265,7 @@ def check_connection() -> str:
         ("/meetings", "meetings"),
         ("/contacts", "contacts"),
         ("/clients", "clients"),
+        ("/files", "files (list)"),
     ]
     for path, label in checks:
         try:
@@ -159,9 +278,9 @@ def check_connection() -> str:
     result["write_support"] = {
         "accounts": "no write scope exists on the API yet",
         "prospects": "no write scope exists on the API yet",
-        "tasks": "scope exists, endpoint 500s on create (reported to vendor)",
-        "clients": "scope exists, endpoint 500s on create (reported to vendor)",
-        "meetings": "scope exists, endpoint 500s on create (reported to vendor)",
+        "tasks": "create_task/update_task available -- last known: 500 on create (vendor bug); re-verify",
+        "clients": "create_client/update_client available -- last known: 500 on create (vendor bug); re-verify",
+        "meetings": "create_meeting/update_meeting available -- last known: 500 on create (vendor bug); re-verify",
         "files": "works -- see upload_file / get_file / delete_file",
     }
     return _ok(result)
@@ -172,22 +291,26 @@ def check_connection() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_accounts() -> str:
+def list_accounts(all_pages: bool = True, params: Optional[dict] = None) -> str:
     """
-    List this tenant's OneConnect accounts (current/active clients and
-    households) -- name, email, phone, status, and whatever other fields
-    OneConnect returns. Read-only.
+    List this tenant's OneConnect accounts (households) -- name, status,
+    owner, phone, email. Read-only.
+
+    all_pages (default True) follows paging so you get every record, not
+    just the first 50; check `_paging.complete` in the result. `params` is
+    passed through as query-string filters if you know one OneConnect
+    honors (e.g. {"client_status": "active_client"}).
     """
-    return _ok(_get(f"/{OC_TENANT}/accounts"))
+    return _list_tool(f"/{OC_TENANT}/accounts", params, all_pages)
 
 
 @mcp.tool()
-def list_prospects() -> str:
+def list_prospects(all_pages: bool = True, params: Optional[dict] = None) -> str:
     """
     List this tenant's OneConnect prospects (pipeline, pre-client) --
-    name, email, phone, status. Read-only.
+    name, email, phone, status. Read-only. Paging/params as list_accounts.
     """
-    return _ok(_get(f"/{OC_TENANT}/prospects"))
+    return _list_tool(f"/{OC_TENANT}/prospects", params, all_pages)
 
 
 # ---------------------------------------------------------------------------
@@ -196,80 +319,336 @@ def list_prospects() -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_tasks() -> str:
-    """List tasks from OneConnect. Read-only. Top-level endpoint (not tenant-scoped)."""
-    return _ok(_get("/tasks"))
+def list_tasks(all_pages: bool = True, params: Optional[dict] = None) -> str:
+    """List tasks from OneConnect. Read-only. Paging/params as list_accounts."""
+    return _list_tool("/tasks", params, all_pages)
 
 
 @mcp.tool()
-def list_meetings() -> str:
-    """List meetings from OneConnect. Read-only. Top-level endpoint (not tenant-scoped)."""
-    return _ok(_get("/meetings"))
+def list_meetings(all_pages: bool = True, params: Optional[dict] = None) -> str:
+    """List meetings from OneConnect. Read-only. Paging/params as list_accounts."""
+    return _list_tool("/meetings", params, all_pages)
 
 
 @mcp.tool()
-def list_contacts() -> str:
-    """List contacts from OneConnect. Read-only. Top-level endpoint (not tenant-scoped)."""
-    return _ok(_get("/contacts"))
+def list_contacts(all_pages: bool = True, params: Optional[dict] = None) -> str:
+    """List contacts (people, each linked to an account via account_id). Read-only. Paging/params as list_accounts."""
+    return _list_tool("/contacts", params, all_pages)
 
 
 @mcp.tool()
-def list_clients() -> str:
+def list_clients(all_pages: bool = True, params: Optional[dict] = None) -> str:
     """
-    List records from OneConnect's /clients endpoint. Read-only,
-    top-level (not tenant-scoped). As of testing 2026-09-01 this returns
-    an empty list for at least one office -- that's a real "no records,"
-    not a broken endpoint, so don't treat an empty result as an error.
+    List records from OneConnect's /clients endpoint -- these are pipeline
+    records (stage, deal_value), e.g. the ones opened by the Advisor
+    Evolution sync. They are a different object from accounts/contacts, so
+    a person can exist here and nowhere else. Read-only. Paging/params as
+    list_accounts.
     """
-    return _ok(_get("/clients"))
+    return _list_tool("/clients", params, all_pages)
 
 
 # ---------------------------------------------------------------------------
-# Files -- the one place write access actually works. Upload requires
-# multipart/form-data; a plain JSON POST 500s. Confirmed with a real
-# create-then-delete round trip on 2026-09-01, no record left behind.
+# Cross-object search. OneConnect's UI search doesn't cover every object
+# type, and a person can live in clients, accounts, contacts or prospects
+# with no link between them -- so look in all four.
+# ---------------------------------------------------------------------------
+
+_SEARCH_SOURCES = {
+    "accounts": (lambda: f"/{OC_TENANT}/accounts",
+                 ("account_name", "first_name", "last_name", "nickname", "email", "phone"),
+                 ("id", "account_name", "client_status", "owner_name", "phone", "email")),
+    "prospects": (lambda: f"/{OC_TENANT}/prospects",
+                  ("name", "email", "phone"),
+                  ("id", "name", "status", "owner_name", "phone", "email", "next_meeting_at")),
+    "contacts": (lambda: "/contacts",
+                 ("name", "email", "phone", "company"),
+                 ("id", "name", "email", "phone", "account_id", "client_id")),
+    "clients": (lambda: "/clients",
+                ("company_name", "contact_name", "contact_email", "contact_phone"),
+                ("id", "company_name", "stage", "deal_value", "contact_email", "contact_phone", "notes")),
+}
+
+
+def _digits(s: str) -> str:
+    return "".join(ch for ch in s if ch.isdigit())
+
+
+def _matches(rec: dict, fields, query: str) -> bool:
+    hay = " ".join(str(rec.get(f) or "") for f in fields).lower()
+    q = query.strip().lower()
+    qd = _digits(q)
+    if len(qd) >= 7 and qd in _digits(hay):
+        return True
+    tokens = [t for t in q.replace(",", " ").split() if t]
+    return bool(tokens) and all(t in hay for t in tokens)
+
+
+@mcp.tool()
+def find_person(query: str, sources: Optional[list[str]] = None) -> str:
+    """
+    Find a person/household by name, email, or phone across ALL OneConnect
+    record types at once -- accounts, prospects, contacts and clients
+    (pipeline). Use this instead of guessing which list someone is in.
+
+    Name matching is case-insensitive and token-based ("courtney richards"
+    matches "Richards, Courtney"). Phone matching ignores formatting when
+    the query has 7+ digits. `sources` limits the search, e.g.
+    ["clients", "contacts"]. Each hit is tagged with its source so you know
+    where the record lives -- a hit only in "clients" means there's no
+    household/contact record for that person yet.
+    """
+    wanted = sources or list(_SEARCH_SOURCES)
+    out = {"query": query, "hits": [], "searched": {}}
+    for name in wanted:
+        if name not in _SEARCH_SOURCES:
+            out["searched"][name] = "unknown source"
+            continue
+        path_fn, match_fields, keep = _SEARCH_SOURCES[name]
+        try:
+            _, records, meta = _list_all(path_fn(), None, True)
+            out["searched"][name] = meta
+        except Exception as e:
+            out["searched"][name] = f"error: {e}"
+            continue
+        for rec in records:
+            if _matches(rec, match_fields, query):
+                hit = {"source": name}
+                hit.update({k: rec.get(k) for k in keep if k in rec})
+                out["hits"].append(hit)
+    out["hit_count"] = len(out["hits"])
+    return _ok(out)
+
+
+# ---------------------------------------------------------------------------
+# Read-only probe -- for testing token scopes against paths this connector
+# has no dedicated tool for (planner, reports, analytics, team, scrum,
+# qa_*). GET only, so it can never change data.
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def api_get(path: str, params: Optional[dict] = None) -> str:
+    """
+    Make a read-only GET against any OneConnect API path and return the
+    status and (truncated) body. Use it to test whether a scope on the
+    token (planner, reports, analytics, team, scrum, qa_*) has a live
+    endpoint, or to discover query params. `{tenant}` in the path is
+    replaced with this connector's tenant slug, e.g. "/{tenant}/planner".
+    GET only -- this tool cannot create, change or delete anything.
+    """
+    if not path.startswith("/") or ".." in path or "://" in path:
+        raise ValueError("path must be an API-relative path like '/reports' or '/{tenant}/planner'")
+    path = path.replace("{tenant}", OC_TENANT)
+    with httpx.Client(timeout=30) as client:
+        r = client.get(f"{OC_BASE}{path}", headers=_headers(), params=_clean(params))
+    try:
+        body = r.json()
+        preview = json.dumps(body, default=str)
+    except Exception:
+        preview = r.text
+    return _ok({
+        "status": r.status_code,
+        "url": str(r.request.url),
+        "body_preview": preview[:4000],
+        "truncated": len(preview) > 4000,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Writes for tasks / meetings / clients. The scopes exist on the token; the
+# last live test (2026-09-01) saw OneConnect 500 on every create. These tools
+# exist so that can be re-verified and so they start working the day the
+# vendor fixes it. Errors come back with the vendor's body and any trace
+# headers so they can go straight into a support ticket.
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def create_task(
+    title: str,
+    description: Optional[str] = None,
+    due_date: Optional[str] = None,
+    priority: Optional[str] = None,
+    status: Optional[str] = None,
+    account_id: Optional[str] = None,
+    client_id: Optional[int] = None,
+    prospect_id: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+) -> str:
+    """
+    Create a OneConnect task. due_date is ISO 8601 (e.g. "2026-11-05");
+    priority is low/medium/high; status defaults to OneConnect's own
+    default (pending). assigned_to is a OneConnect user id -- omit to let
+    OneConnect assign it to the token's owner.
+    Last known state: OneConnect 500s on this (vendor bug). Re-verify.
+    """
+    return _ok(_send("POST", "/tasks", _clean({
+        "title": title, "description": description, "due_date": due_date,
+        "priority": priority, "status": status, "account_id": account_id,
+        "client_id": client_id, "prospect_id": prospect_id, "assigned_to": assigned_to,
+    })))
+
+
+@mcp.tool()
+def update_task(task_id: int, fields: dict) -> str:
+    """Update a OneConnect task (PATCH). `fields` e.g. {"status": "completed"} or {"due_date": "2026-11-12"}."""
+    return _ok(_send("PATCH", f"/tasks/{task_id}", fields))
+
+
+@mcp.tool()
+def create_meeting(
+    title: str,
+    meeting_date: str,
+    duration_minutes: Optional[int] = None,
+    status: Optional[str] = None,
+    description: Optional[str] = None,
+    notes: Optional[str] = None,
+    transcript_summary: Optional[str] = None,
+    action_items: Optional[list] = None,
+    account_id: Optional[str] = None,
+    client_id: Optional[int] = None,
+    prospect_id: Optional[str] = None,
+) -> str:
+    """
+    Create a OneConnect meeting record -- e.g. to file a meeting summary
+    against a household instead of as a loose File Cabinet document.
+    meeting_date is ISO 8601 with offset (e.g. "2026-10-29T14:00:00-04:00").
+    Last known state: OneConnect 500s on this (vendor bug). Re-verify.
+    """
+    return _ok(_send("POST", "/meetings", _clean({
+        "title": title, "meeting_date": meeting_date, "duration_minutes": duration_minutes,
+        "status": status, "description": description, "notes": notes,
+        "transcript_summary": transcript_summary, "action_items": action_items,
+        "account_id": account_id, "client_id": client_id, "prospect_id": prospect_id,
+    })))
+
+
+@mcp.tool()
+def update_meeting(meeting_id: int, fields: dict) -> str:
+    """Update a OneConnect meeting (PATCH), e.g. {"notes": "...", "transcript_summary": "..."}."""
+    return _ok(_send("PATCH", f"/meetings/{meeting_id}", fields))
+
+
+@mcp.tool()
+def create_client(
+    company_name: str,
+    contact_name: Optional[str] = None,
+    contact_email: Optional[str] = None,
+    contact_phone: Optional[str] = None,
+    stage: Optional[str] = None,
+    deal_value: Optional[float] = None,
+    notes: Optional[str] = None,
+    next_review_date: Optional[str] = None,
+) -> str:
+    """
+    Create a OneConnect /clients (pipeline) record. stage is one of
+    discovery/proposal/underwriting/issued/lost.
+    Last known state: OneConnect 500s on this (vendor bug). Re-verify.
+    """
+    return _ok(_send("POST", "/clients", _clean({
+        "company_name": company_name, "contact_name": contact_name or company_name,
+        "contact_email": contact_email, "contact_phone": contact_phone, "stage": stage,
+        "deal_value": deal_value, "notes": notes, "next_review_date": next_review_date,
+    })))
+
+
+@mcp.tool()
+def update_client(client_id: int, fields: dict) -> str:
+    """Update a OneConnect /clients record (PATCH), e.g. {"stage": "issued"} or {"next_review_date": "2027-04-01"}."""
+    return _ok(_send("PATCH", f"/clients/{client_id}", fields))
+
+
+@mcp.tool()
+def delete_record(kind: str, record_id: int, confirm_title: str) -> str:
+    """
+    Permanently delete a task, meeting or client record -- intended for
+    removing test records created while re-verifying writes. kind is
+    "tasks", "meetings" or "clients". confirm_title must exactly equal the
+    record's title/company_name, as a guard against deleting the wrong id.
+    No undo.
+    """
+    if kind not in ("tasks", "meetings", "clients"):
+        raise ValueError("kind must be tasks, meetings or clients")
+    rec = _get(f"/{kind}/{record_id}")
+    if isinstance(rec, dict) and isinstance(rec.get("data"), dict):
+        rec = rec["data"]
+    actual = (rec or {}).get("title") or (rec or {}).get("company_name")
+    if actual != confirm_title:
+        raise ValueError(f"confirm_title mismatch: record {record_id} is titled {actual!r}; nothing deleted")
+    return _ok(_send("DELETE", f"/{kind}/{record_id}", {}))
+
+
+# ---------------------------------------------------------------------------
+# Files -- the one place write access is confirmed working. Upload requires
+# multipart/form-data; a plain JSON POST 500s.
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 def get_file(file_id: int) -> str:
     """
-    Fetch a single OneConnect file record by its numeric id. Useful
-    because GET /files (the list endpoint) currently returns a 500 --
-    there's no way to browse files, only to fetch one you already know
-    the id of (e.g. the id upload_file just gave you).
+    Fetch a single OneConnect file record by its numeric id, including a
+    short-lived signed download_url. GET /files (the list endpoint) has
+    historically 500'd -- try list_files first, fall back to this when
+    you already know the id.
     """
     return _ok(_get(f"/files/{file_id}"))
 
 
 @mcp.tool()
-def upload_file(filename: str, content_base64: str, mime_type: Optional[str] = None) -> str:
+def list_files(params: Optional[dict] = None) -> str:
     """
-    Upload a file to OneConnect's general File Cabinet. Confirmed working
-    2026-09-01 -- must be sent as multipart/form-data (a JSON POST to
-    this same endpoint 500s, so this tool always uses multipart).
+    List File Cabinet records. Has historically 500'd on OneConnect's side;
+    if it errors, the error body is returned so it can be reported.
+    `params` is passed through as query-string filters (e.g.
+    {"client_id": 24583}).
+    """
+    return _list_tool("/files", params, all_pages=False)
 
-    Pass the file's bytes as base64 in content_base64. The created
-    record starts in "pending_upload" status and isn't yet linked to a
-    specific client/account/meeting -- OneConnect's create endpoint
-    doesn't expose that association as of this testing. Keep the
-    returned id if you'll want to fetch (get_file) or remove
-    (delete_file) it later.
+
+@mcp.tool()
+def upload_file(
+    filename: str,
+    content_base64: str,
+    mime_type: Optional[str] = None,
+    client_id: Optional[int] = None,
+    account_id: Optional[str] = None,
+    meeting_id: Optional[int] = None,
+) -> str:
+    """
+    Upload a file to OneConnect's File Cabinet (multipart/form-data).
+
+    Allowed types (live-tested): text/plain (.txt) and application/pdf.
+    .md / text/markdown is REJECTED with 400 -- save Markdown as .txt.
+    content_base64 must pass through the model, so keep each file under
+    ~13.5 KB and split larger documents into parts.
+
+    client_id / account_id / meeting_id are sent as form fields to link
+    the file to a record. OneConnect has historically ignored them -- the
+    response's `_link_check` says whether each link actually stuck. If not,
+    put the client name in the filename and body so the file is findable.
     """
     raw = base64.b64decode(content_base64)
     files = {"file": (filename, raw, mime_type or "application/octet-stream")}
-    with httpx.Client(timeout=30) as client:
-        r = client.post(f"{OC_BASE}/files", headers=_headers(), files=files)
+    links = _clean({"client_id": client_id, "account_id": account_id, "meeting_id": meeting_id})
+    with httpx.Client(timeout=60) as client:
+        r = client.post(
+            f"{OC_BASE}/files", headers=_headers(), files=files,
+            data={k: str(v) for k, v in links.items()},
+        )
         _raise_with_body(r)
-        return _ok(r.json())
+        rec = r.json()
+    if links and isinstance(rec, dict):
+        rec["_link_check"] = {
+            k: ("linked" if str(rec.get(k)) == str(v) else f"NOT linked (OneConnect returned {rec.get(k)!r})")
+            for k, v in links.items()
+        }
+    return _ok(rec)
 
 
 @mcp.tool()
 def delete_file(file_id: int) -> str:
     """
     Permanently delete a OneConnect file record by its numeric id.
-    Confirmed working 2026-09-01 (create-then-delete round trip left
-    nothing behind, verified with a follow-up 404). OneConnect has no
-    trash/undo for this as far as this connector has tested -- double
+    Confirmed working (re-verified 2026-10-29). No trash/undo -- double
     check the id before calling this on anything that wasn't a test
     upload.
     """
